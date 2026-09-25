@@ -108,8 +108,9 @@ production compose splits them into dedicated workers for high volumes.
 ### What `setup` does
 
 - The RSA key (`keys` volume, `config/keys/private.pem`), generated once: it
-  signs webhooks (JWT) and login tokens. **Back it up**: the `backup` service
-  includes it.
+  signs webhooks (JWT) and login tokens. Lago reads this file before its
+  `LAGO_RSA_PRIVATE_KEY` variable (not set by the stack). **Back it up**:
+  the `backup` service includes it.
 - `rails db:migrate` and Lago's predefined roles (what Lago's `migrate.sh`
   does). On a new database Rails loads Lago's schema file instead of running
   the migrations, and that file doesn't configure pg_partman; `setup` then
@@ -178,8 +179,9 @@ Emails
 ------
 
 SMTP comes from `SMTP_*`: Lago uses STARTTLS when the server offers it
-(port 587) and doesn't support SMTPS (465); without `SMTP_HOST` no email is
-sent. `SMTP_FROM` is the sender of account emails.
+(port 587), authenticates with `LOGIN` and doesn't support SMTPS (465);
+without `SMTP_HOST` no email is sent. `SMTP_FROM` is the sender of account
+emails.
 
 Backups
 -------
@@ -274,8 +276,10 @@ Notes:
   partition but not pg_partman's configuration nor the monthly partitions,
   so pg_partman would never manage the table (also with Lago's own images).
   `setup` repeats Lago's partitioning migration while the default partition
-  is empty; pg_partman's background worker (enabled in `db`) keeps future
-  partitions created hourly. An upgraded database ends up identical to a
+  is empty. pg_partman is optional for Lago's migrations (skipped when the
+  extension is missing) and Lago never runs pg_partman's maintenance: only
+  pg_partman's background worker (enabled in `db`) creates the future
+  partitions, hourly. An upgraded database ends up identical to a
   fresh one.
 - From inside the containers, the host machine is reachable as
   `host.docker.internal`.
@@ -292,6 +296,10 @@ Security
 - Lago's metrics endpoint is not published; its admin and data APIs refuse
   every request (no `ADMIN_API_KEY`/`LAGO_DATA_API_BEARER_TOKEN` set).
 - The RSA key volume is private (mode 700).
+- Lago logs request parameters (GraphQL included); emails, passwords and
+  tokens are filtered from GraphQL variables (how the front sends them), not
+  from values written inline in a query: API clients should pass secrets as
+  variables.
 - Not included: a web application firewall or off-site backup copies.
 
 Validation
