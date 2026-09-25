@@ -1,0 +1,85 @@
+# Caddy in front of Lago: TLS, the API under /api, the front and security
+# headers.
+#
+# Like Lago's production compose (Traefik):
+# - /api/v1/..., /api/v2/... → api (Rails routes them with the /api prefix)
+# - other /api/... → api without the prefix (LAGO_API_URL = <url>/api: file
+#   downloads under /api/rails/..., payment providers' webhooks)
+# - /graphql and /cable (the front's API and live updates), /rails/ (file
+#   downloads redirect there) → api
+# - everything else → front (single-page app)
+# Lago's Prometheus metrics (/metrics, no authentication) stay internal.
+{
+	# No admin API: config is static, reloads happen by restarting the container.
+	admin off
+
+	servers {
+		# Behind a reverse proxy on a private network, log the real client IP
+		# (X-Forwarded-For) and pass X-Forwarded-Proto on to Lago.
+		trusted_proxies static private_ranges
+		# Client IP = the right-most untrusted address (can't be spoofed).
+		trusted_proxies_strict
+	}
+}
+
+(lago) {
+	encode zstd gzip
+
+	request_body {
+		max_size {$UPLOAD_MAX_SIZE}
+	}
+
+	# One directive per header: in a single `header { }` block, Caddy applies
+	# the "?" (set if missing) fields together, only when all are missing.
+	header ?X-Content-Type-Options nosniff
+	header ?X-Frame-Options SAMEORIGIN
+	header ?Referrer-Policy strict-origin-when-cross-origin
+	header -Server
+
+	@metrics path /metrics /metrics/* /api/metrics /api/metrics/*
+	@api_versioned path_regexp ^/api/v[0-9]+/
+	@api path /graphql /cable /health /rails/*
+
+	# route: the handle blocks are tried in the written order.
+	route {
+		handle @metrics {
+			respond 404
+		}
+		handle @api_versioned {
+			reverse_proxy api:3000 {
+				# Rails (ActionDispatch::RemoteIp) takes the last untrusted
+				# X-Forwarded-For entry; send only the real one.
+				header_up X-Forwarded-For {client_ip}
+			}
+		}
+		handle /api/* {
+			uri strip_prefix /api
+			reverse_proxy api:3000 {
+				header_up X-Forwarded-For {client_ip}
+			}
+		}
+		handle @api {
+			reverse_proxy api:3000 {
+				header_up X-Forwarded-For {client_ip}
+			}
+		}
+		handle {
+			reverse_proxy front:80
+		}
+	}
+}
+
+# Public site. SITE_ADDRESS is ":80" for plain HTTP (local, or behind another
+# proxy) or a domain name, which makes Caddy obtain and renew a certificate
+# automatically ("localhost" uses Caddy's internal CA).
+{$SITE_ADDRESS} {
+	import lago
+	log {
+		output stdout
+	}
+}
+
+# Internal-only site (port not published) for the container healthcheck.
+:8080 {
+	import lago
+}

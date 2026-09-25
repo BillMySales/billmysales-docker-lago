@@ -1,0 +1,8 @@
+# Spanish amounts with Spanish separators ("$19.990", "1.234,50"): Lago's
+# es.yml uses English ones ("$19,990"). Loaded after Lago's locale files
+# (config/locales/**, alphabetical), so only these keys change. Remove the
+# mount in compose.yaml to keep Lago's format.
+es:
+  money:
+    decimal_mark: ","
+    thousands_separator: "."

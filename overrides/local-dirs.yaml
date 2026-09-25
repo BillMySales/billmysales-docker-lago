@@ -1,0 +1,45 @@
+# Keep the stack's data in local directories instead of named volumes, so it
+# is visible from the host (and easy to include in host-level backups).
+#
+# In .env:
+#   COMPOSE_FILE=compose.yaml:overrides/local-dirs.yaml
+#   DATA_DIR=./data        # optional, default ./data (relative to compose.yaml)
+#
+# Only the directories you keep here change; delete the lines you don't need
+# (e.g. keep just `storage`, `keys` and `backups`). Existing data in the named
+# volumes is NOT moved: switch before the first `up`, or restore a backup
+# afterwards. `setup` gives `storage` and `keys` to LAGO_UID (1000) on every
+# run, also on Linux. Backup files are root-owned with mode 0600.
+
+x-lago-dirs: &lago-dirs
+  - ${DATA_DIR:-./data}/storage:/app/storage
+  - ${DATA_DIR:-./data}/keys:/app/config/keys:ro
+
+services:
+  db:
+    volumes:
+      - ${DATA_DIR:-./data}/db:/var/lib/postgresql/data
+  redis:
+    volumes:
+      - ${DATA_DIR:-./data}/redis:/data
+  setup:
+    volumes:
+      - ${DATA_DIR:-./data}/storage:/app/storage
+      - ${DATA_DIR:-./data}/keys:/app/config/keys
+  api:
+    volumes: *lago-dirs
+  worker:
+    volumes: *lago-dirs
+  clock:
+    volumes: *lago-dirs
+  console:
+    volumes: *lago-dirs
+  caddy:
+    volumes:
+      - ${DATA_DIR:-./data}/caddy/data:/data
+      - ${DATA_DIR:-./data}/caddy/config:/config
+  backup:
+    volumes:
+      - ${DATA_DIR:-./data}/storage:/data/storage
+      - ${DATA_DIR:-./data}/keys:/data/keys
+      - ${DATA_DIR:-./data}/backups:/backups

@@ -1,0 +1,391 @@
+# Lago stack: Caddy (TLS) + Lago API, worker and clock (official image) + Lago
+# front (official image) + Gotenberg (PDFs) + PostgreSQL with pg_partman (own
+# image from image/postgres) + Redis, with a setup job and optional backups
+# and Mailpit.
+#
+# Quick start (development):
+#   cp .env.dev.example .env
+#   docker compose up -d --build
+#   docker compose logs -f setup   # wait for "==> Done"
+#
+# Production: start from .env.prod.example instead. See README.md.
+#
+# Required variables have no default: compose refuses to start without them.
+
+name: ${COMPOSE_PROJECT_NAME:-lago}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILE:-3}"
+
+# The Lago API image, shared by setup, api, worker, clock and console. It has
+# no user of its own and runs as root: the stack runs it as LAGO_UID.
+x-lago: &lago
+  image: getlago/api:${LAGO_VERSION:-v1.53.0}
+  logging: *logging
+  user: "${LAGO_UID:-1000}:${LAGO_UID:-1000}"
+  tmpfs:
+    - /app/tmp:uid=${LAGO_UID:-1000},gid=${LAGO_UID:-1000}
+
+x-lago-env: &lago-env
+  RAILS_ENV: production
+  LAGO_VERSION: ${LAGO_VERSION:-v1.53.0}
+  RAILS_LOG_TO_STDOUT: "true"
+  LAGO_URL: ${LAGO_URL:?Set LAGO_URL in .env (e.g. https://billing.example.com)}
+  # The API is published under /api on the same site (Caddy strips it).
+  LAGO_API_URL: ${LAGO_URL:?Set LAGO_URL in .env (e.g. https://billing.example.com)}/api
+  LAGO_FRONT_URL: ${LAGO_URL:?Set LAGO_URL in .env (e.g. https://billing.example.com)}
+  DATABASE_URL: postgresql://${DB_USER:-lago}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@db:5432/${DB_NAME:-lago}?search_path=public
+  REDIS_URL: redis://redis:6379
+  LAGO_REDIS_CACHE_URL: redis://redis:6379
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:?Set SECRET_KEY_BASE in .env}
+  LAGO_ENCRYPTION_PRIMARY_KEY: ${LAGO_ENCRYPTION_PRIMARY_KEY:?Set LAGO_ENCRYPTION_PRIMARY_KEY in .env}
+  LAGO_ENCRYPTION_DETERMINISTIC_KEY: ${LAGO_ENCRYPTION_DETERMINISTIC_KEY:?Set LAGO_ENCRYPTION_DETERMINISTIC_KEY in .env}
+  LAGO_ENCRYPTION_KEY_DERIVATION_SALT: ${LAGO_ENCRYPTION_KEY_DERIVATION_SALT:?Set LAGO_ENCRYPTION_KEY_DERIVATION_SALT in .env}
+  # Lago assumes every request is HTTPS unless this is set: take the scheme
+  # from X-Forwarded-Proto (sent by Caddy) instead, so links follow LAGO_URL.
+  LAGO_DISABLE_SSL: "true"
+  LAGO_PDF_URL: http://pdf:3000
+  LAGO_DISABLE_PDF_GENERATION: ${LAGO_DISABLE_PDF_GENERATION:-false}
+  LAGO_USE_AWS_S3: "false"
+  LAGO_USE_GCS: "false"
+  # No self-service signups: the organization and its admin come from setup.
+  LAGO_DISABLE_SIGNUP: "true"
+  # Lago sends usage data to Segment unless disabled.
+  LAGO_DISABLE_SEGMENT: ${LAGO_DISABLE_SEGMENT:-true}
+  LAGO_SIDEKIQ_WEB: "false"
+  LAGO_LICENSE: ${LAGO_LICENSE:-}
+  LAGO_FROM_EMAIL: ${SMTP_FROM:-}
+  LAGO_SMTP_ADDRESS: ${SMTP_HOST:-}
+  LAGO_SMTP_PORT: ${SMTP_PORT:-587}
+  LAGO_SMTP_USERNAME: ${SMTP_USER:-}
+  LAGO_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SIDEKIQ_CONCURRENCY: ${SIDEKIQ_CONCURRENCY:-10}
+  DATABASE_POOL: ${SIDEKIQ_CONCURRENCY:-10}
+  RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}
+  WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+
+x-lago-volumes: &lago-volumes
+  # Uploads and generated PDFs (Active Storage).
+  - storage:/app/storage
+  # RSA key (signs webhooks and tokens), read from config/keys/private.pem.
+  - keys:/app/config/keys:ro
+  - ./config/lago/locales/zz_stack_es.yml:/app/config/locales/zz_stack_es.yml:ro
+  - ./scripts:/usr/local/share/stack/scripts:ro
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-lago-postgres}:${POSTGRES_VERSION:-15}-partman${PARTMAN_VERSION:-5.4.3}
+    build:
+      context: ./image/postgres
+      args:
+        POSTGRES_VERSION: ${POSTGRES_VERSION:-15}
+        PARTMAN_VERSION: v${PARTMAN_VERSION:-5.4.3}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_DB: ${DB_NAME:-lago}
+      POSTGRES_USER: ${DB_USER:-lago}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    # pg_partman's background worker keeps the partitioned tables' future
+    # partitions created (hourly).
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_partman_bgw
+      - -c
+      - pg_partman_bgw.interval=3600
+      - -c
+      - pg_partman_bgw.role=${DB_USER:-lago}
+      - -c
+      - pg_partman_bgw.dbname=${DB_NAME:-lago}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${DB_MEMORY_LIMIT:-1g}
+
+  # Sidekiq queues, cache and Action Cable.
+  redis:
+    image: redis:${REDIS_VERSION:-7.4}-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-256m}
+
+  # One-shot job: RSA key, migrations, organization and admin user, initial
+  # settings. Safe to repeat; runs on every `up`.
+  setup:
+    <<: *lago
+    restart: "no"
+    # Root only to own the keys and storage volumes; Lago runs as LAGO_UID.
+    user: root
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *lago-env
+      LAGO_UID: ${LAGO_UID:-1000}
+      LAGO_ORG_NAME: ${LAGO_ORG_NAME:-Lago}
+      LAGO_ADMIN_EMAIL: ${LAGO_ADMIN_EMAIL:?Set LAGO_ADMIN_EMAIL in .env}
+      LAGO_ADMIN_PASSWORD: ${LAGO_ADMIN_PASSWORD:?Set LAGO_ADMIN_PASSWORD in .env}
+      LAGO_API_KEY: ${LAGO_API_KEY:-}
+      LAGO_COUNTRY: ${LAGO_COUNTRY:-CL}
+      LAGO_CURRENCY: ${LAGO_CURRENCY:-CLP}
+      LAGO_DOCUMENT_LOCALE: ${LAGO_DOCUMENT_LOCALE:-es}
+      LAGO_CITY: ${LAGO_CITY:-Santiago}
+      LAGO_TAX_RATE: ${LAGO_TAX_RATE-19}
+      LAGO_TAX_NAME: ${LAGO_TAX_NAME:-IVA}
+    volumes:
+      - storage:/app/storage
+      - keys:/app/config/keys
+      - ./scripts:/usr/local/share/stack/scripts:ro
+    command: ["bash", "/usr/local/share/stack/scripts/setup.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: ${SETUP_MEMORY_LIMIT:-1g}
+
+  # REST API (/api/v1), GraphQL (front), webhooks from payment providers,
+  # Action Cable (Puma, internal port 3000).
+  api:
+    <<: *lago
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *lago-env
+    # Lets Lago reach services on the host (e.g. a webhook receiver running
+    # locally) at http://host.docker.internal:<port>, also on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes: *lago-volumes
+    command: ["./scripts/start.api.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEMORY_LIMIT:-1g}
+
+  # Sidekiq: billing, invoices and PDFs, webhooks, emails, events.
+  worker:
+    <<: *lago
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *lago-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes: *lago-volumes
+    command: ["./scripts/start.worker.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-1g}
+
+  # Clockwork: schedules the periodic jobs (billing runs, terminations...).
+  clock:
+    <<: *lago
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *lago-env
+    volumes: *lago-volumes
+    command: ["./scripts/start.clock.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q clockwork /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${CLOCK_MEMORY_LIMIT:-768m}
+
+  # Front (single-page app on the image's nginx, internal port 80).
+  front:
+    image: getlago/front:${LAGO_VERSION:-v1.53.0}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      API_URL: ${LAGO_URL:?Set LAGO_URL in .env (e.g. https://billing.example.com)}
+      APP_ENV: production
+      LAGO_DISABLE_SIGNUP: "true"
+      LAGO_DISABLE_PDF_GENERATION: ${LAGO_DISABLE_PDF_GENERATION:-false}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          memory: ${FRONT_MEMORY_LIMIT:-128m}
+
+  # Gotenberg (Chromium): renders invoices and credit notes to PDF.
+  pdf:
+    image: getlago/lago-gotenberg:${GOTENBERG_VERSION:-8.15}
+    restart: unless-stopped
+    logging: *logging
+    command:
+      - gotenberg
+      - --libreoffice-disable-routes=true
+      - --chromium-disable-javascript=true
+      - --api-timeout=300s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${PDF_MEMORY_LIMIT:-1g}
+
+  caddy:
+    image: caddy:${CADDY_VERSION:-2.11}-alpine
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      api:
+        condition: service_healthy
+      front:
+        condition: service_healthy
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-32M}
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-80}:80"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTPS_PORT:-443}:443"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # TLS certificates and keys (keep them: ACME rate limits).
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: ${CADDY_MEMORY_LIMIT:-256m}
+
+  # Rails console and tasks (profile "tools"), e.g.:
+  #   docker compose run --rm console bin/rails runner 'puts Organization.count'
+  console:
+    <<: *lago
+    profiles: ["tools"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *lago-env
+    volumes: *lago-volumes
+    command: ["bin/rails", "console"]
+    deploy:
+      resources:
+        limits:
+          memory: ${CONSOLE_MEMORY_LIMIT:-1g}
+
+  # Optional (profile "backup"): database dump + storage (PDFs, uploads) +
+  # RSA key every BACKUP_INTERVAL_HOURS, kept BACKUP_KEEP_DAYS days in the
+  # `backups` volume (overrides/local-dirs.yaml puts them in a local directory
+  # instead).
+  backup:
+    image: ${POSTGRES_IMAGE:-lago-postgres}:${POSTGRES_VERSION:-15}-partman${PARTMAN_VERSION:-5.4.3}
+    profiles: ["backup"]
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-lago}
+      DB_USER: ${DB_USER:-lago}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      LAGO_UID: ${LAGO_UID:-1000}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+    volumes:
+      # Read-write so `backup.sh restore` can put them back.
+      - storage:/data/storage
+      - keys:/data/keys
+      - backups:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["bash", "/usr/local/bin/backup.sh"]
+    healthcheck:
+      test: ["CMD", "bash", "/usr/local/bin/backup.sh", "health"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    deploy:
+      resources:
+        limits:
+          memory: ${BACKUP_MEMORY_LIMIT:-512m}
+
+  # Optional (profile "mailpit", development): catches all outgoing mail.
+  # Set SMTP_HOST=mailpit and SMTP_PORT=1025; web UI on MAILPIT_PORT.
+  mailpit:
+    image: axllent/mailpit:${MAILPIT_VERSION:-v1.31}
+    profiles: ["mailpit"]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${MAILPIT_PORT:-8025}:8025"
+
+volumes:
+  db_data:
+  redis_data:
+  storage:
+  keys:
+  caddy_data:
+  caddy_config:
+  backups:
