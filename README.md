@@ -42,7 +42,7 @@ Quick start (development)
 
 ```shell
 cp .env.dev.example .env
-docker compose up -d --build   # builds the database image the first time
+docker compose up -d           # builds the database image the first time
 docker compose logs -f setup   # wait for "==> Done"
 ```
 
@@ -57,10 +57,10 @@ Production
 
 ```shell
 cp .env.prod.example .env
-# Fill in LAGO_URL, SITE_ADDRESS, SECRET_KEY_BASE, the three
-# LAGO_ENCRYPTION_* keys, DB_PASSWORD, LAGO_ADMIN_EMAIL,
-# LAGO_ADMIN_PASSWORD and the SMTP_* values.
-docker compose up -d --build
+# Required: LAGO_URL, SITE_ADDRESS, SECRET_KEY_BASE, the three
+# LAGO_ENCRYPTION_* keys, DB_PASSWORD, LAGO_ADMIN_EMAIL, LAGO_ADMIN_PASSWORD.
+# Recommended: the SMTP_* values (without SMTP_HOST no emails are sent).
+docker compose up -d
 ```
 
 - Keep the secrets outside the server too: without the `LAGO_ENCRYPTION_*`
@@ -124,8 +124,9 @@ production compose splits them into dedicated workers for high volumes.
     organization by name, so renaming it would create a second one; this
     script doesn't).
   - every run: the admin user (`LAGO_ADMIN_EMAIL`) exists with an admin
-    membership, and `LAGO_API_KEY`, if set, is one of the organization's API
-    keys.
+    membership (created if no user with that email exists: changing it
+    later adds another one), and `LAGO_API_KEY`, if set, is one of the
+    organization's API keys.
 
 Common commands
 ---------------
@@ -214,9 +215,12 @@ Upgrades
 Back up first, then change `LAGO_VERSION` in `.env` and run
 `docker compose up -d`: the new images are pulled and `setup` runs the
 migrations before the API starts. Read Lago's release notes; Lago releases a
-minor version every few weeks. For PostgreSQL patch releases rebuild the
-database image (`docker compose build --pull db`); a new major version needs
-a dump and restore.
+minor version every few weeks. The database image (the only one built
+locally) is built by `up -d` whenever its tag changes (`POSTGRES_VERSION`,
+`PARTMAN_VERSION`; set `PARTMAN_SHA256` for another pg_partman release); for
+PostgreSQL patch releases rebuild it (`docker compose build --pull db`, then
+`docker compose up -d`). A new PostgreSQL major version needs a dump and
+restore.
 
 Overrides
 ---------
@@ -255,7 +259,8 @@ Every variable is documented in `.env.prod.example`. Main groups:
 - **Edition and telemetry**: `LAGO_LICENSE`, `LAGO_DISABLE_SEGMENT`,
   `LAGO_DISABLE_PDF_GENERATION`.
 - **Versions**: `LAGO_VERSION`, `GOTENBERG_VERSION`, `POSTGRES_VERSION`,
-  `PARTMAN_VERSION`, `REDIS_VERSION`, `CADDY_VERSION`, ...
+  `PARTMAN_VERSION`, `PARTMAN_SHA256`, `REDIS_VERSION`, `CADDY_VERSION`,
+  ...
 - **Mail**: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
   `SMTP_FROM`.
 - **Processes, resources and logs**: `LAGO_UID`, `WEB_CONCURRENCY`,

@@ -5,7 +5,7 @@
 #
 # Quick start (development):
 #   cp .env.dev.example .env
-#   docker compose up -d --build
+#   docker compose up -d           # builds the database image the first time
 #   docker compose logs -f setup   # wait for "==> Done"
 #
 # Production: start from .env.prod.example instead. See README.md.
@@ -83,6 +83,7 @@ services:
       args:
         POSTGRES_VERSION: ${POSTGRES_VERSION:-15}
         PARTMAN_VERSION: v${PARTMAN_VERSION:-5.4.3}
+        PARTMAN_SHA256: ${PARTMAN_SHA256-c52e3b8cf80d306468f48fbdb1905e4c2574bf8362240af57aebbbf9e18c6fe2}
     restart: unless-stopped
     logging: *logging
     environment:
